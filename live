@@ -1,0 +1,340 @@
+import React, { useEffect, useRef, useState } from "react";
+
+/**
+ * Live STT Dashboard (single-file React component)
+ * - TailwindCSS is assumed available in the project.
+ * - Default export is a React component that can be used in any app.
+ * - UI shows live transcript, speaker diarization (speaker chips + timeline), and simple VU meters.
+ *
+ * How it works (overview):
+ * 1. Browser captures microphone audio using getUserMedia.
+ * 2. Audio is processed into 16-bit PCM chunks and sent to a WebSocket server (/ws) as base64.
+ * 3. The server performs ASR + diarization (example backends described below). Server sends back messages:
+ *    { type: 'transcript', text, interim, speaker, timestamp }
+ *    { type: 'speakers', speakers: [{id, label, color}] }
+ *    { type: 'diarization-timeline', segments: [{start, end, speaker}] }
+ * 4. Frontend displays transcripts, groups by speaker and shows a timeline.
+ *
+ * NOTE: This file focuses on the frontend. Implementing a robust realtime ASR+diarization backend
+ * is non-trivial and two suggested options are included in comments at the bottom.
+ */
+
+// util: convert Float32Array to Int16 and base64-encode
+function floatTo16BitPCMBase64(float32Array) {
+  const buffer = new ArrayBuffer(float32Array.length * 2);
+  const view = new DataView(buffer);
+  let offset = 0;
+  for (let i = 0; i < float32Array.length; i++, offset += 2) {
+    let s = Math.max(-1, Math.min(1, float32Array[i]));
+    view.setInt16(offset, s < 0 ? s * 0x8000 : s * 0x7fff, true);
+  }
+  // base64
+  let binary = '';
+  const bytes = new Uint8Array(buffer);
+  const chunk = 0x8000;
+  for (let i = 0; i < bytes.length; i += chunk) {
+    binary += String.fromCharCode.apply(null, bytes.subarray(i, i + chunk));
+  }
+  return btoa(binary);
+}
+
+function uniqueColorFromId(id) {
+  // deterministic color pick for a given numeric id
+  const colors = [
+    'bg-blue-500', 'bg-green-500', 'bg-red-500', 'bg-yellow-500', 'bg-indigo-500', 'bg-pink-500', 'bg-teal-500',
+  ];
+  return colors[id % colors.length];
+}
+
+export default function LiveSTTDashboard({ wsUrl = 'ws://localhost:9000/ws' }) {
+  const [connected, setConnected] = useState(false);
+  const [speakers, setSpeakers] = useState([]); // {id, label, color}
+  const [segments, setSegments] = useState([]); // diarization timeline segments
+  const [transcripts, setTranscripts] = useState([]); // {id, speaker, text, interim, timestamp}
+  const wsRef = useRef(null);
+  const mediaRef = useRef(null);
+  const audioCtxRef = useRef(null);
+  const sourceRef = useRef(null);
+  const processorRef = useRef(null);
+  const [isRecording, setIsRecording] = useState(false);
+  const [vu, setVu] = useState(0);
+  const transcriptContainerRef = useRef(null);
+
+  useEffect(() => {
+    return () => stopRecording();
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
+
+  function ensureWS() {
+    if (wsRef.current && (wsRef.current.readyState === WebSocket.OPEN || wsRef.current.readyState === WebSocket.CONNECTING)) return;
+    wsRef.current = new WebSocket(wsUrl);
+    wsRef.current.onopen = () => {
+      setConnected(true);
+      console.log('ws open');
+    };
+    wsRef.current.onclose = () => {
+      setConnected(false);
+      console.log('ws closed');
+    };
+    wsRef.current.onerror = (e) => console.error('ws error', e);
+    wsRef.current.onmessage = (ev) => {
+      try {
+        const msg = JSON.parse(ev.data);
+        handleServerMessage(msg);
+      } catch (e) {
+        console.warn('non-json message from server', ev.data);
+      }
+    };
+  }
+
+  function handleServerMessage(msg) {
+    if (msg.type === 'speakers') {
+      const mapped = msg.speakers.map(s => ({ ...s, color: s.color || uniqueColorFromId(s.id) }));
+      setSpeakers(mapped);
+    } else if (msg.type === 'transcript') {
+      // server sends partial/interim and final transcripts with speaker id
+      const entry = {
+        id: msg.id ?? Math.random().toString(36).slice(2, 9),
+        speaker: msg.speaker ?? 0,
+        text: msg.text,
+        interim: !!msg.interim,
+        timestamp: msg.timestamp ?? Date.now(),
+      };
+      setTranscripts(prev => {
+        // keep partial updates in place: replace by id if exists
+        const idx = prev.findIndex(p => p.id === entry.id);
+        if (idx >= 0) {
+          const copy = [...prev];
+          copy[idx] = entry;
+          return copy;
+        }
+        return [...prev, entry];
+      });
+      // auto-scroll transcript view
+      setTimeout(() => {
+        transcriptContainerRef.current?.scrollTo({ top: transcriptContainerRef.current.scrollHeight, behavior: 'smooth' });
+      }, 100);
+    } else if (msg.type === 'diarization-timeline') {
+      setSegments(msg.segments || []);
+    } else if (msg.type === 'speaker-activity') {
+      // optional: VU activity per speaker
+      // {speaker, level}
+      setVu(msg.level ?? 0);
+    }
+  }
+
+  async function startRecording() {
+    ensureWS();
+    if (!navigator.mediaDevices || !navigator.mediaDevices.getUserMedia) {
+      alert('getUserMedia not supported in this browser');
+      return;
+    }
+    const stream = await navigator.mediaDevices.getUserMedia({ audio: true, video: false });
+    mediaRef.current = stream;
+    audioCtxRef.current = new (window.AudioContext || window.webkitAudioContext)({ sampleRate: 16000 });
+    sourceRef.current = audioCtxRef.current.createMediaStreamSource(stream);
+
+    // create processor (ScriptProcessor deprecated but widely supported) - bufferSize 4096
+    const processor = audioCtxRef.current.createScriptProcessor(4096, 1, 1);
+    processorRef.current = processor;
+
+    const analyser = audioCtxRef.current.createAnalyser();
+    analyser.fftSize = 2048;
+    sourceRef.current.connect(analyser);
+    analyser.connect(processor);
+
+    processor.onaudioprocess = (e) => {
+      const input = e.inputBuffer.getChannelData(0);
+      // compute simple RMS for VU meter
+      let sum = 0.0;
+      for (let i = 0; i < input.length; i++) sum += input[i] * input[i];
+      const rms = Math.sqrt(sum / input.length);
+      setVu(Math.min(1, rms * 5));
+
+      // convert and send partial chunk to server
+      const base64 = floatTo16BitPCMBase64(input);
+      if (wsRef.current && wsRef.current.readyState === WebSocket.OPEN) {
+        const payload = JSON.stringify({ type: 'audio', audio: base64, sample_rate: audioCtxRef.current.sampleRate });
+        wsRef.current.send(payload);
+      }
+    };
+
+    sourceRef.current.connect(processor);
+    processor.connect(audioCtxRef.current.destination);
+    setIsRecording(true);
+  }
+
+  function stopRecording() {
+    try {
+      processorRef.current?.disconnect();
+      sourceRef.current?.disconnect();
+      mediaRef.current?.getTracks()?.forEach(t => t.stop());
+      audioCtxRef.current?.close();
+    } catch (e) {
+      console.warn('stop error', e);
+    }
+    setIsRecording(false);
+  }
+
+  function toggleRecording() {
+    if (isRecording) stopRecording(); else startRecording();
+  }
+
+  function speakerLabel(id) {
+    const s = speakers.find(x => x.id === id);
+    return s ? s.label : `Speaker ${id}`;
+  }
+
+  // UI helpers: grouped transcripts by speaker
+  const grouped = transcripts.reduce((acc, t) => {
+    const key = t.speaker ?? '0';
+    if (!acc[key]) acc[key] = [];
+    acc[key].push(t);
+    return acc;
+  }, {});
+
+  return (
+    <div className="min-h-screen bg-gray-50 p-6">
+      <div className="max-w-7xl mx-auto">
+        <header className="flex items-center justify-between mb-6">
+          <h1 className="text-2xl font-bold">Live STT & Diarization Dashboard</h1>
+          <div className="flex items-center gap-3">
+            <button onClick={toggleRecording} className={`px-4 py-2 rounded shadow ${isRecording ? 'bg-red-500 text-white' : 'bg-white border'}`}>
+              {isRecording ? 'Stop' : 'Start'}
+            </button>
+            <div className="text-sm text-gray-600">WS: <span className={`${connected ? 'text-green-600' : 'text-red-500'}`}>{connected ? 'connected' : 'disconnected'}</span></div>
+          </div>
+        </header>
+
+        <main className="grid grid-cols-3 gap-6">
+          {/* Left: Speakers */}
+          <section className="col-span-1 bg-white rounded p-4 shadow">
+            <h2 className="text-lg font-semibold mb-3">Speakers</h2>
+            <div className="space-y-3">
+              {speakers.length === 0 && <div className="text-sm text-gray-500">No speaker info yet. The server may auto-detect speakers.</div>}
+              {speakers.map(s => (
+                <div key={s.id} className="flex items-center gap-3">
+                  <div className={`w-10 h-10 rounded-full flex items-center justify-center text-white ${s.color || uniqueColorFromId(s.id)}`}>{s.label?.slice(0,2) ?? `S${s.id}`}</div>
+                  <div>
+                    <div className="font-medium">{s.label || `Speaker ${s.id}`}</div>
+                    <div className="text-xs text-gray-500">id: {s.id}</div>
+                  </div>
+                </div>
+              ))}
+            </div>
+
+            <div className="mt-6">
+              <h3 className="text-sm font-medium">Microphone Level</h3>
+              <div className="w-full h-3 bg-gray-200 rounded mt-2 overflow-hidden">
+                <div style={{ width: `${Math.round(vu * 100)}%` }} className="h-full bg-green-400" />
+              </div>
+            </div>
+          </section>
+
+          {/* Center: Live transcript */}
+          <section className="col-span-1 bg-white rounded p-4 shadow flex flex-col">
+            <h2 className="text-lg font-semibold mb-3">Live Transcript</h2>
+            <div ref={transcriptContainerRef} className="flex-1 overflow-auto p-2 space-y-3 border rounded">
+              {Object.keys(grouped).length === 0 && <div className="text-sm text-gray-500">No transcripts yet.</div>}
+              {Object.entries(grouped).map(([speakerId, items]) => (
+                <div key={speakerId} className="py-1">
+                  <div className="flex items-center gap-2 mb-1">
+                    <div className={`w-8 h-8 rounded-full flex items-center justify-center text-white ${uniqueColorFromId(Number(speakerId))}`}>{speakerLabel(Number(speakerId)).slice(0,2)}</div>
+                    <div className="text-sm font-medium">{speakerLabel(Number(speakerId))}</div>
+                  </div>
+                  <div className="pl-10">
+                    {items.map(it => (
+                      <div key={it.id} className={`mb-1 ${it.interim ? 'opacity-60 italic' : ''}`}>
+                        <div className="inline-block p-2 rounded-lg bg-gray-100">{it.text}</div>
+                      </div>
+                    ))}
+                  </div>
+                </div>
+              ))}
+            </div>
+          </section>
+
+          {/* Right: Timeline / controls */}
+          <section className="col-span-1 bg-white rounded p-4 shadow">
+            <h2 className="text-lg font-semibold mb-3">Diarization Timeline</h2>
+            <div className="h-32 border rounded p-2 overflow-auto">
+              {segments.length === 0 && <div className="text-sm text-gray-500">No diarization segments yet.</div>}
+              {segments.map((seg, idx) => (
+                <div key={idx} className="mb-2">
+                  <div className="flex items-center gap-2">
+                    <div className={`w-4 h-4 rounded ${uniqueColorFromId(seg.speaker)}`} />
+                    <div className="text-sm font-medium">{speakerLabel(seg.speaker)}</div>
+                    <div className="text-xs text-gray-500">{(seg.start/1000).toFixed(1)}s — {(seg.end/1000).toFixed(1)}s</div>
+                  </div>
+                </div>
+              ))}
+            </div>
+
+            <div className="mt-4">
+              <h3 className="text-sm font-medium mb-2">Controls & Notes</h3>
+              <ul className="text-sm text-gray-600 list-disc list-inside space-y-1">
+                <li>This demo sends raw 16-bit PCM base64 chunks — adjust sample rate on the server if different.</li>
+                <li>For production use, use WebRTC + server gateway or a codec like Opus for efficient streaming.</li>
+                <li>Server should send interim transcripts with `interim: true` and final with `interim: false`.</li>
+              </ul>
+            </div>
+          </section>
+        </main>
+
+        <footer className="mt-6 text-sm text-gray-500">Tip: Use a backend that performs streaming ASR + speaker attribution (pyannote for diarization, Whisper/WhisperX/ONNX for ASR), then forward results to this frontend as JSON over WebSocket.</footer>
+      </div>
+    </div>
+  );
+}
+
+/**
+ * --------------------------- BACKEND SUGGESTIONS (not part of the React component) ---------------------------
+ *
+ * Minimal Node WebSocket forwarder (concept):
+ * - A simple Node.js `ws` server accepts audio messages from the browser and forwards them to a worker
+ *   (python) which runs ASR + diarization and replies with transcript messages.
+ *
+ * Example Node.js (conceptual):
+ * const WebSocket = require('ws');
+ * const wss = new WebSocket.Server({ port: 9000 });
+ * wss.on('connection', ws => {
+ *   ws.on('message', msg => {
+ *     // msg is JSON {type:'audio', audio: 'BASE64', sample_rate}
+ *     // forward to Python ASR worker (TCP/UDP/WS) or write to a queue (Redis/RabbitMQ)
+ *   });
+ * });
+ *
+ * ASR + Diarization Worker (Python, conceptual):
+ * - Option A (research / high-quality): Use pyannote.audio for diarization and a streaming ASR
+ *   model (whisperx, OpenAI Realtime, Vosk, or a streaming transducer model) for low-latency transcripts.
+ * - Option B (faster setup): Use OpenAI's streaming speech-to-text (if you have API access) or Whisper large-v2
+ *   running in a server that supports streaming inputs. For speaker attribution, run pyannote on buffered audio
+ *   segments (e.g., run diarization every 5–15 seconds and merge results).
+ *
+ * Example Python flow (very high level):
+ * 1. Accept base64 PCM from websocket
+ * 2. Append into a ring buffer per connection
+ * 3. Send short chunks to a streaming ASR engine to get interim transcriptions
+ * 4. Run diarization in parallel on growing buffer (non-real-time initially)
+ * 5. Map ASR timestamps to diarization segments and emit messages:
+ *    {type:'transcript', id, text, interim, speaker, timestamp}
+ *    {type:'speakers', speakers:[{id,label,color}]}
+ *    {type:'diarization-timeline', segments:[{start,end,speaker}]}
+ *
+ * Useful libraries / projects:
+ * - pyannote.audio (speaker diarization)
+ * - whisperx (ASR with word-level timestamps)
+ * - faster-whisper / whisper.cpp / OpenAI streaming API (for lower-latency ASR)
+ * - torchaudio or soundfile for decoding and resampling
+ *
+ * Production tips:
+ * - Use WebRTC for high-quality low-latency audio transport; Node can act as SFU or use mediasoup/Janus.
+ * - For many concurrent users, perform diarization offline or in micro-batches to save GPU.
+ * - Cache speaker embeddings to keep consistent speaker IDs across the call.
+ *
+ * If you want, I can also provide ready-to-run backend code (Node + Python) that integrates:
+ * - websocket receiver (Node)
+ * - python worker using faster-whisper for streaming ASR and pyannote for diarization
+ *
+ * -----------------------------------------------------------------------------------------------
+ */

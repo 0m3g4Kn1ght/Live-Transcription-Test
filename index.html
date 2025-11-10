@@ -1,0 +1,96 @@
+<!-- index.html -->
+<!doctype html>
+<html>
+<head>
+  <meta charset="utf-8" />
+  <title>Live Transcribe + Diarization</title>
+  <style>
+    body { font-family: Arial, sans-serif; padding: 12px; }
+    #log { border:1px solid #ddd; padding:8px; height:400px; overflow:auto; white-space:pre-wrap; }
+    .segment { margin: 6px 0; padding:6px; border-radius:6px; background:#f6f6f6; }
+    .speaker { font-weight:700; color:#333; }
+    .time { font-size:0.9em; color:#666; }
+    .text { margin-top:4px; }
+  </style>
+</head>
+<body>
+  <h2>Live Transcribe + Diarization</h2>
+  <button id="start">Start</button>
+  <button id="stop" disabled>Stop</button>
+  <div id="status"></div>
+  <div id="log"></div>
+
+<script>
+let ws;
+let mediaRecorder;
+let audioContext;
+let source;
+let processor;
+const SAMPLE_RATE = 16000;
+
+function appendLog(html) {
+  const log = document.getElementById("log");
+  log.insertAdjacentHTML('beforeend', html);
+  log.scrollTop = log.scrollHeight;
+}
+
+document.getElementById("start").onclick = async () => {
+  ws = new WebSocket("ws://"+location.hostname+":8000/ws");
+  ws.binaryType = "arraybuffer";
+  ws.onopen = () => { document.getElementById("status").innerText = "WebSocket open"; };
+  ws.onmessage = (ev) => {
+    try {
+      const data = JSON.parse(ev.data);
+      if (data.type === "segments") {
+        for (const s of data.segments) {
+          appendLog(`<div class="segment"><div class="speaker">${s.speaker} <span class="time">[${s.start.toFixed(2)} - ${s.end.toFixed(2)}]</span></div><div class="text">${s.text}</div></div>`);
+        }
+      }
+    } catch (e) { console.error(e); }
+  };
+
+  // get mic
+  const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
+  audioContext = new (window.AudioContext || window.webkitAudioContext)({ sampleRate: SAMPLE_RATE });
+  source = audioContext.createMediaStreamSource(stream);
+  // create ScriptProcessorNode (deprecated but simple) — alternative: AudioWorklet for production
+  processor = audioContext.createScriptProcessor(4096, 1, 1);
+  source.connect(processor);
+  processor.connect(audioContext.destination);
+  processor.onaudioprocess = (e) => {
+    const channelData = e.inputBuffer.getChannelData(0);
+    // convert float32 [-1..1] to 16-bit PCM
+    const pcm16 = floatTo16BitPCM(channelData);
+    if (ws && ws.readyState === WebSocket.OPEN) {
+      ws.send(pcm16.buffer);
+    }
+  };
+
+  document.getElementById("start").disabled = true;
+  document.getElementById("stop").disabled = false;
+};
+
+document.getElementById("stop").onclick = () => {
+  if (processor) { processor.disconnect(); processor = null; }
+  if (source) { source.disconnect(); source = null; }
+  if (audioContext) { audioContext.close(); audioContext = null; }
+  if (ws) { ws.close(); ws = null; }
+  document.getElementById("start").disabled = false;
+  document.getElementById("stop").disabled = true;
+};
+
+function floatTo16BitPCM(float32Array) {
+  const l = float32Array.length;
+  const buffer = new ArrayBuffer(l * 2);
+  const view = new DataView(buffer);
+  let offset = 0;
+  for (let i = 0; i < l; i++, offset += 2) {
+    let s = Math.max(-1, Math.min(1, float32Array[i]));
+    s = s < 0 ? s * 0x8000 : s * 0x7FFF;
+    view.setInt16(offset, s, true); // little-endian
+  }
+  return new Int16Array(buffer);
+}
+</script>
+</body>
+</html>
